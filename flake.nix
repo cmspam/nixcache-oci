@@ -53,7 +53,17 @@
         port = lib.mkOption {
           type = lib.types.port;
           default = 37515;
-          description = "Local port the proxy listens on.";
+          description = "Port the proxy listens on.";
+        };
+        listenAddress = lib.mkOption {
+          type = lib.types.str;
+          default = "127.0.0.1";
+          example = "0.0.0.0";
+          description = ''
+            Address the proxy binds to.
+            Use "127.0.0.1" for local-only access (default).
+            Use "0.0.0.0" to serve the cache to other machines on your network.
+          '';
         };
         publicKey = lib.mkOption {
           type = lib.types.str;
@@ -86,6 +96,7 @@
           environment = {
             NIXCACHE_REPO = cfg.repo;
             NIXCACHE_PORT = toString cfg.port;
+            NIXCACHE_LISTEN = cfg.listenAddress;
           };
           serviceConfig = {
             ExecStart = "${self.packages.${pkgs.system}.cache-proxy}/bin/nixcache-proxy";

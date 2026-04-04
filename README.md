@@ -144,7 +144,8 @@ This starts the proxy as a systemd service and configures Nix's substituters and
 | Variable | Default | Description |
 |---|---|---|
 | `NIXCACHE_REPO` | `cmspam/nixcache-oci` | GitHub owner/repo |
-| `NIXCACHE_PORT` | `37515` | Local port |
+| `NIXCACHE_PORT` | `37515` | Port to listen on |
+| `NIXCACHE_LISTEN` | `127.0.0.1` | Bind address (`0.0.0.0` to serve LAN clients) |
 | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | Upstream cache URLs (space-separated) |
 | `GITHUB_TOKEN` | (none) | Token for private repos |
 | `NIXCACHE_INDEX_TTL` | `300` | Index refresh interval (seconds) |

@@ -22,6 +22,7 @@ from pathlib import Path
 REPO = os.environ.get("NIXCACHE_REPO", "cmspam/nixcache-oci")
 REGISTRY = os.environ.get("NIXCACHE_REGISTRY", "ghcr.io")
 PORT = int(os.environ.get("NIXCACHE_PORT", "37515"))
+LISTEN_ADDR = os.environ.get("NIXCACHE_LISTEN", "127.0.0.1")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
 INDEX_DIR = Path(
     os.environ.get(
@@ -328,7 +329,7 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"nixcache-proxy starting on http://localhost:{PORT}", file=sys.stderr)
+    print(f"nixcache-proxy starting on http://{LISTEN_ADDR}:{PORT}", file=sys.stderr)
     print(f"  Repo: {REPO}", file=sys.stderr)
     print(f"  Upstream: {', '.join(UPSTREAM_CACHES)}", file=sys.stderr)
     print(f"  Index TTL: {INDEX_TTL}s", file=sys.stderr)
@@ -336,7 +337,7 @@ def main():
     # Pre-fetch index
     cache_index.get()
 
-    server = http.server.HTTPServer(("127.0.0.1", PORT), CacheHandler)
+    server = http.server.HTTPServer((LISTEN_ADDR, PORT), CacheHandler)
 
     def shutdown(signum, frame):
         print("\nShutting down...", file=sys.stderr)
