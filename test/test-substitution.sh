@@ -74,7 +74,7 @@ nix-env -iA nixpkgs.python3 nixpkgs.curl 2>&1 | tail -3
 echo ">>> Starting proxy..."
 NIXCACHE_REPO="$REPO" python3 /proxy/main.py &
 PROXY_PID=$!
-sleep 2
+sleep 3
 
 if ! kill -0 $PROXY_PID 2>/dev/null; then
     echo "!!! Proxy failed to start"
@@ -82,11 +82,20 @@ if ! kill -0 $PROXY_PID 2>/dev/null; then
 fi
 
 echo ">>> Testing /nix-cache-info..."
-CACHE_INFO=$(curl -fs http://localhost:37515/nix-cache-info)
+CACHE_INFO=$(curl -fs --max-time 10 http://localhost:37515/nix-cache-info)
 echo "$CACHE_INFO"
 
+# Wait for index to load (narinfo lookups need it)
+echo ">>> Waiting for index to load..."
+for i in $(seq 1 30); do
+    if curl -fs --max-time 5 "http://localhost:37515/${STORE_HASH}.narinfo" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
 echo ">>> Testing narinfo lookup for $STORE_HASH..."
-NARINFO=$(curl -fs "http://localhost:37515/${STORE_HASH}.narinfo") || {
+NARINFO=$(curl -fs --max-time 15 "http://localhost:37515/${STORE_HASH}.narinfo") || {
     echo "!!! narinfo lookup failed"
     kill $PROXY_PID 2>/dev/null; exit 1
 }

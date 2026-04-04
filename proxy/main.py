@@ -334,10 +334,10 @@ def main():
     print(f"  Upstream: {', '.join(UPSTREAM_CACHES)}", file=sys.stderr)
     print(f"  Index TTL: {INDEX_TTL}s", file=sys.stderr)
 
-    # Pre-fetch index
-    cache_index.get()
-
     server = http.server.HTTPServer((LISTEN_ADDR, PORT), CacheHandler)
+
+    # Pre-fetch index in background so server starts immediately
+    threading.Thread(target=cache_index.get, daemon=True).start()
 
     def shutdown(signum, frame):
         print("\nShutting down...", file=sys.stderr)
