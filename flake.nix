@@ -63,6 +63,16 @@
             Public key for verifying cache signatures.
             Generate with: nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
             The proxy also exposes the key at http://localhost:PORT/public-key
+            Leave empty and set requireSignatures = false to use without signing.
+          '';
+        };
+        requireSignatures = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            Whether to require valid signatures from this cache.
+            Set to false if you haven't configured a signing key.
+            When true, you must also set publicKey.
           '';
         };
       };
@@ -86,7 +96,9 @@
         };
         nix.settings = {
           substituters = [ "http://localhost:${toString cfg.port}" ];
+          trusted-substituters = [ "http://localhost:${toString cfg.port}" ];
           trusted-public-keys = lib.mkIf (cfg.publicKey != "") [ cfg.publicKey ];
+          require-sigs = lib.mkIf (!cfg.requireSignatures) false;
         };
       };
     };

@@ -31,30 +31,71 @@ Uses GitHub Container Registry (GHCR) as a storage backend — NARs are stored a
 
 2. Push to `main`. The workflow auto-discovers all outputs, builds them, and uploads only what's not already on cache.nixos.org.
 
-3. Set up signing (see [Signing](#signing) below).
+3. Set up signing (see [Signing](#signing) below), or disable it for quick testing.
 
 ### Signing
 
-Nix requires cache signatures to verify that downloaded packages haven't been tampered with. Without a signing key, clients would need `require-sigs = false`, which is insecure.
+Signing is optional but recommended. It lets Nix verify that packages haven't been tampered with.
 
-**Generate a key pair** (do this once):
+#### Without signing (quick start)
+
+If you don't set a `NIX_SIGNING_KEY` secret, the cache works but packages are unsigned. Clients must disable signature verification:
+
+**NixOS module:**
+```nix
+services.nixcache-proxy = {
+  enable = true;
+  requireSignatures = false;
+};
+```
+
+**Manual nix.conf:**
+```ini
+extra-substituters = http://localhost:37515
+extra-trusted-substituters = http://localhost:37515
+require-sigs = false
+```
+
+This is fine for personal use or testing, but not recommended for shared or production caches.
+
+#### With signing (recommended)
+
+**Step 1 — Generate a key pair** (do this once, on any machine):
 ```bash
 nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
 ```
 
-**Store the private key** as a GitHub Actions secret named `NIX_SIGNING_KEY`:
-```bash
-# Copy the contents of secret.key into your repo's Settings > Secrets > Actions
-cat secret.key
+This creates two files:
+- `secret.key` — the private signing key (keep this secret)
+- `public.key` — contains a string like `my-cache-1:BASE64...=` (give this to clients)
+
+**Step 2 — Store the private key** as a GitHub Actions secret:
+
+Go to your repo's **Settings > Secrets and variables > Actions**, create a secret named `NIX_SIGNING_KEY`, and paste the contents of `secret.key`.
+
+**Step 3 — Give the public key to clients.** Open `public.key` and copy the string. It looks like:
+```
+my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 ```
 
-**Distribute the public key** to clients. The key looks like `my-cache-1:BASE64...=`. Clients need this to verify signatures. You have several options:
+Clients need this string to verify signatures. Three ways to provide it:
 
-- **NixOS module**: set `services.nixcache-proxy.publicKey = "my-cache-1:...";`
-- **Manual nix.conf**: add `trusted-public-keys = my-cache-1:... cache.nixos.org-1:...`
-- **Auto-discovery**: the proxy exposes the key at `http://localhost:37515/public-key` (fetched from the cache index)
+**NixOS module:**
+```nix
+services.nixcache-proxy = {
+  enable = true;
+  publicKey = "my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+};
+```
 
-If no `NIX_SIGNING_KEY` secret is set, the workflow generates an ephemeral key per run. This is fine for testing but signatures won't be verifiable across builds.
+**Manual nix.conf:**
+```ini
+extra-substituters = http://localhost:37515
+extra-trusted-substituters = http://localhost:37515
+extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+```
+
+**Auto-discovery** (for scripts): the proxy serves the public key at `http://localhost:37515/public-key` if one was configured during publishing.
 
 ### Automated updates
 
@@ -71,13 +112,7 @@ Trigger manually anytime: `gh workflow run update-and-cache.yml`
 ```bash
 nix run github:cmspam/nixcache-oci#cache-proxy &
 ```
-
-Then add to `~/.config/nix/nix.conf` or `/etc/nix/nix.conf`:
-```ini
-extra-substituters = http://localhost:37515
-extra-trusted-substituters = http://localhost:37515
-extra-trusted-public-keys = my-cache-1:BASE64KEY...=
-```
+Then configure Nix (see [Signing](#signing) above for what to put in nix.conf).
 
 **Option B — NixOS module (persistent, recommended):**
 ```nix
@@ -90,7 +125,10 @@ extra-trusted-public-keys = my-cache-1:BASE64KEY...=
         {
           services.nixcache-proxy = {
             enable = true;
+            # With signing:
             publicKey = "my-cache-1:BASE64KEY...=";
+            # Or without signing:
+            # requireSignatures = false;
           };
         }
       ];

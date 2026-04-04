@@ -24,13 +24,10 @@ jobs:
           if [[ -n "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
             echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
             echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+            echo ">>> Signing key configured"
           else
-            echo ">>> No signing key configured, generating ephemeral key"
-            nix-store --generate-binary-cache-key nixcache-oci-1 \
-              "$RUNNER_TEMP/signing-key" "$RUNNER_TEMP/signing-key.pub"
-            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
-            echo "::warning::Using ephemeral signing key. Set NIX_SIGNING_KEY secret for persistent signing."
-            echo "Public key: $(cat $RUNNER_TEMP/signing-key.pub)"
+            echo ">>> No signing key configured — cache will be unsigned"
+            echo "::notice::Cache packages will not be signed. Set NIX_SIGNING_KEY secret to enable signing. Clients will need require-sigs = false."
           fi
 
       - name: Log in to GHCR

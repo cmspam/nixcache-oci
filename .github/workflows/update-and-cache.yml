@@ -24,9 +24,7 @@ jobs:
             echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
             echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
           else
-            nix-store --generate-binary-cache-key nixcache-oci-1 \
-              "$RUNNER_TEMP/signing-key" "$RUNNER_TEMP/signing-key.pub"
-            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+            echo ">>> No signing key configured — cache will be unsigned"
           fi
 
       - name: Log in to GHCR
