@@ -385,14 +385,19 @@ upload_to_oci() {
         local name
         name=$(basename "$store_path" | sed 's/^[a-z0-9]*-//')
 
-        new_entries=$(echo "$new_entries" | jq \
-            --arg hash "$hash" \
-            --arg name "$name" \
-            --arg narinfo "$narinfo_content" \
-            --arg nar_digest "$nar_digest" \
-            --argjson nar_size "$nar_size" \
-            --arg added "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '. + {($hash): {name: $name, narinfo: $narinfo, nar_digest: $nar_digest, nar_size: $nar_size, added: $added}}')
+        # Use python to properly handle narinfo with newlines in JSON
+        new_entries=$(python3 -c "
+import json, sys
+entries = json.loads(sys.argv[1])
+entries[sys.argv[2]] = {
+    'name': sys.argv[3],
+    'narinfo': open(sys.argv[4]).read(),
+    'nar_digest': sys.argv[5],
+    'nar_size': int(sys.argv[6]),
+    'added': sys.argv[7]
+}
+print(json.dumps(entries))
+" "$new_entries" "$hash" "$name" "$narinfo" "$nar_digest" "$nar_size" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
 
         uploaded=$((uploaded + 1))
     done
