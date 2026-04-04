@@ -148,8 +148,36 @@ This starts the proxy as a systemd service and configures Nix's substituters and
 | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | Upstream cache URLs (space-separated) |
 | `GITHUB_TOKEN` | (none) | Token for private repos |
 | `NIXCACHE_INDEX_TTL` | `300` | Index refresh interval (seconds) |
+| `NIXCACHE_MAX_CACHE_MB` | `2048` | Max disk cache size for downloaded NARs (MB) |
 
-The proxy also exposes `GET /public-key` which returns the cache's public signing key (if configured), useful for automated setup scripts.
+### How the proxy cache works
+
+The proxy caches two things:
+
+- **Index** (all narinfo data): Held in memory, refreshed from GHCR every `NIXCACHE_INDEX_TTL` seconds (default 5 minutes). Between refreshes, narinfo lookups are instant with no network calls. After a new publish, clients will see the new packages within this window.
+
+- **NAR blobs** (downloaded packages): Cached to disk after first download. Since NARs are content-addressed, cached data never goes stale — the same hash always means the same content. Old entries are evicted automatically (LRU) when the cache exceeds `NIXCACHE_MAX_CACHE_MB`.
+
+### Proxy management endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/_status` | GET | Cache statistics: index entries, disk cache size, config |
+| `/_refresh` | POST | Force immediate index refresh (don't wait for TTL) |
+| `/_clear-cache` | POST | Clear all disk-cached NAR blobs |
+| `/public-key` | GET | Cache signing public key (if configured) |
+
+Examples:
+```bash
+# Check cache status
+curl http://localhost:37515/_status
+
+# Force refresh after a publish
+curl -X POST http://localhost:37515/_refresh
+
+# Clear disk cache to free space
+curl -X POST http://localhost:37515/_clear-cache
+```
 
 ## Architecture
 

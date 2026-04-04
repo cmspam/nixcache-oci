@@ -129,8 +129,15 @@ class CacheIndex:
                 self._refresh()
             return self._index or {"entries": {}, "gc_roots": []}
 
+    def force_refresh(self):
+        """Force an immediate refresh, ignoring TTL."""
+        with self._lock:
+            self._last_fetch = 0.0
+            self._refresh()
+            entries = self._index.get("entries", {}) if self._index else {}
+            return len(entries)
+
     def _refresh(self):
-        # Try to fetch from GHCR
         manifest_data = ghcr_fetch("/manifests/cache-index")
         if manifest_data:
             try:
@@ -141,13 +148,12 @@ class CacheIndex:
                     index_data = ghcr_fetch_blob(index_digest)
                     if index_data:
                         self._index = json.loads(index_data)
-                        # Cache to disk
                         self._index_file.parent.mkdir(parents=True, exist_ok=True)
                         self._index_file.write_bytes(index_data)
+                        print(f"[nixcache-proxy] Index refreshed: {len(self._index.get('entries', {}))} entries", file=sys.stderr)
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        # Fall back to disk cache
         if not self._index and self._index_file.exists():
             try:
                 self._index = json.loads(self._index_file.read_bytes())
@@ -164,10 +170,14 @@ class CacheIndex:
 cache_index = CacheIndex()
 
 
+MAX_DISK_CACHE_MB = int(os.environ.get("NIXCACHE_MAX_CACHE_MB", "2048"))
+
+
 class DiskCache:
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, max_mb: int = MAX_DISK_CACHE_MB):
         self.base = base
         self.base.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_mb * 1024 * 1024
 
     def _key_path(self, key: str) -> Path:
         safe = key.replace("/", "--").replace(":", "_")
@@ -175,11 +185,51 @@ class DiskCache:
 
     def get(self, key: str) -> bytes | None:
         p = self._key_path(key)
-        return p.read_bytes() if p.exists() else None
+        if p.exists():
+            p.touch()  # update atime for LRU eviction
+            return p.read_bytes()
+        return None
 
     def put(self, key: str, data: bytes):
         p = self._key_path(key)
         p.write_bytes(data)
+        self._maybe_evict()
+
+    def _maybe_evict(self):
+        """Evict oldest files if cache exceeds size limit."""
+        files = list(self.base.iterdir())
+        total = sum(f.stat().st_size for f in files if f.is_file())
+        if total <= self.max_bytes:
+            return
+        # Sort by modification time (oldest first) and delete until under limit
+        files.sort(key=lambda f: f.stat().st_mtime)
+        for f in files:
+            if total <= self.max_bytes * 0.8:  # evict down to 80%
+                break
+            if f.is_file():
+                size = f.stat().st_size
+                f.unlink()
+                total -= size
+
+    def clear(self):
+        """Remove all cached blobs."""
+        count = 0
+        for f in self.base.iterdir():
+            if f.is_file():
+                f.unlink()
+                count += 1
+        return count
+
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        files = [f for f in self.base.iterdir() if f.is_file()]
+        total = sum(f.stat().st_size for f in files)
+        return {
+            "entries": len(files),
+            "size_bytes": total,
+            "size_mb": round(total / (1024 * 1024), 1),
+            "max_mb": MAX_DISK_CACHE_MB,
+        }
 
 
 disk_cache = DiskCache(CACHE_DIR / "blobs")
@@ -204,10 +254,21 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
             self._serve_bytes(get_nci_response(), "text/x-nix-cache-info")
         elif path == "/public-key":
             self._serve_public_key()
+        elif path == "/_status":
+            self._serve_status()
         elif path.endswith(".narinfo"):
             self._serve_narinfo(path)
         elif path.startswith("/nar/"):
             self._serve_nar(path)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        path = self.path.rstrip("/")
+        if path == "/_refresh":
+            self._handle_refresh()
+        elif path == "/_clear-cache":
+            self._handle_clear_cache()
         else:
             self.send_error(404)
 
@@ -218,6 +279,29 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
             self._serve_bytes(pk.encode() + b"\n", "text/plain")
         else:
             self.send_error(404, "No public key configured")
+
+    def _serve_status(self):
+        index = cache_index.get()
+        status = {
+            "index_entries": len(index.get("entries", {})),
+            "index_generated": index.get("generated", "unknown"),
+            "index_ttl": INDEX_TTL,
+            "disk_cache": disk_cache.stats(),
+            "repo": REPO,
+            "upstream": UPSTREAM_CACHES,
+        }
+        body = json.dumps(status, indent=2).encode() + b"\n"
+        self._serve_bytes(body, "application/json")
+
+    def _handle_refresh(self):
+        count = cache_index.force_refresh()
+        body = json.dumps({"refreshed": True, "entries": count}).encode() + b"\n"
+        self._serve_bytes(body, "application/json")
+
+    def _handle_clear_cache(self):
+        removed = disk_cache.clear()
+        body = json.dumps({"cleared": True, "removed": removed}).encode() + b"\n"
+        self._serve_bytes(body, "application/json")
 
     def _serve_bytes(self, data: bytes, content_type: str):
         self.send_response(200)
