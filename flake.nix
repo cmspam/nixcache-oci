@@ -95,9 +95,9 @@
           };
         };
         nix.settings = {
-          substituters = [ "http://localhost:${toString cfg.port}" ];
-          trusted-substituters = [ "http://localhost:${toString cfg.port}" ];
-          trusted-public-keys = lib.mkIf (cfg.publicKey != "") [ cfg.publicKey ];
+          extra-substituters = [ "http://localhost:${toString cfg.port}" ];
+          extra-trusted-substituters = [ "http://localhost:${toString cfg.port}" ];
+          extra-trusted-public-keys = lib.mkIf (cfg.publicKey != "") [ cfg.publicKey ];
           require-sigs = lib.mkIf (!cfg.requireSignatures) false;
         };
       };
