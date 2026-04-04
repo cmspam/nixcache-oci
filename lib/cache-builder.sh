@@ -217,11 +217,11 @@ build_outputs() {
     local all_paths=()
     for ref in "${refs[@]}"; do
         info "Building $ref"
+        # Build with verbose output (stderr shown in CI logs), JSON to file
         local json_file
         json_file=$(mktemp)
-        nix build "$ref" --no-link --json > "$json_file" 2>&1 || {
+        nix build "$ref" --no-link --json > "$json_file" 2>&2 || {
             err "Failed to build $ref"
-            cat "$json_file" >&2
             rm -f "$json_file"
             return 1
         }
@@ -279,55 +279,95 @@ filter_upstream() {
     fi
 }
 
-export_cache() {
+# export_paths_directly <store_paths...> — export only the given paths as NARs
+# This is MUCH faster than `nix copy --to file://` which exports the entire
+# closure (potentially thousands of paths). We dump each path individually,
+# compress it, compute hashes, generate narinfo, and sign if configured.
+export_paths_directly() {
     local paths=("$@")
     if [[ ${#paths[@]} -eq 0 ]]; then
         info "No paths to export"
         return 0
     fi
 
-    mkdir -p "$CACHE_DIR"
+    mkdir -p "$CACHE_DIR/nar"
 
-    local dest="file://${CACHE_DIR}"
+    # Sign paths in the local store if we have a key
     if [[ -n "$NIXCACHE_SIGNING_KEY_FILE" ]]; then
-        dest="file://${CACHE_DIR}?secret-key=${NIXCACHE_SIGNING_KEY_FILE}"
+        info "Signing ${#paths[@]} store paths"
+        nix store sign --key-file "$NIXCACHE_SIGNING_KEY_FILE" "${paths[@]}" 2>&1 >&2 || true
     fi
 
-    info "Exporting ${#paths[@]} store paths to local cache"
-    nix copy --to "$dest" "${paths[@]}"
-    info "Cache exported to $CACHE_DIR"
-}
+    info "Exporting ${#paths[@]} store paths (direct NAR dump, skipping full closure)"
 
-prune_upstream_from_cache() {
-    local keep_paths=("$@")
-    local keep_hashes=()
-    for p in "${keep_paths[@]}"; do
-        keep_hashes+=($(basename "$p" | cut -c1-32))
-    done
-
-    local removed=0
-    for narinfo in "$CACHE_DIR"/*.narinfo; do
-        [[ -f "$narinfo" ]] || continue
+    for store_path in "${paths[@]}"; do
         local hash
-        hash=$(basename "$narinfo" .narinfo)
+        hash=$(basename "$store_path" | cut -c1-32)
+        local nar_file="$CACHE_DIR/nar/${hash}.nar.xz"
 
-        local dominated=true
-        for kh in "${keep_hashes[@]}"; do
-            if [[ "$hash" == "$kh" ]]; then
-                dominated=false
-                break
-            fi
-        done
+        # Dump and compress the NAR
+        nix-store --dump "$store_path" | xz -1 > "$nar_file"
 
-        if [[ "$dominated" == "true" ]]; then
-            local nar_url
-            nar_url=$(grep '^URL: ' "$narinfo" | head -1 | cut -d' ' -f2)
-            rm -f "$CACHE_DIR/$nar_url"
-            rm -f "$narinfo"
-            removed=$((removed + 1))
-        fi
+        local file_size file_hash
+        file_size=$(stat -c%s "$nar_file")
+        file_hash=$(nix hash file --type sha256 --base32 "$nar_file")
+
+        # Get path info for narinfo metadata
+        local path_info
+        path_info=$(nix path-info --json "$store_path" 2>/dev/null)
+
+        # Generate narinfo
+        python3 -c "
+import json, sys, os
+
+store_path = sys.argv[1]
+hash_prefix = sys.argv[2]
+nar_file = sys.argv[3]
+file_size = int(sys.argv[4])
+file_hash = sys.argv[5]
+cache_dir = sys.argv[6]
+
+info = json.loads(sys.argv[7])
+# nix path-info --json returns a list or dict depending on version
+if isinstance(info, list):
+    info = info[0]
+elif isinstance(info, dict) and store_path in info:
+    info = info[store_path]
+
+nar_hash = info.get('narHash', '')
+nar_size = info.get('narSize', 0)
+refs = info.get('references', [])
+deriver = info.get('deriver', '')
+sigs = info.get('signatures', info.get('sigs', []))
+
+# Build references as just the basename of each ref path
+ref_names = ' '.join(os.path.basename(r) for r in refs)
+
+lines = [
+    f'StorePath: {store_path}',
+    f'URL: nar/{hash_prefix}.nar.xz',
+    f'Compression: xz',
+    f'FileHash: sha256:{file_hash}',
+    f'FileSize: {file_size}',
+    f'NarHash: {nar_hash}',
+    f'NarSize: {nar_size}',
+]
+if ref_names:
+    lines.append(f'References: {ref_names}')
+if deriver:
+    lines.append(f'Deriver: {os.path.basename(deriver)}')
+for sig in sigs:
+    lines.append(f'Sig: {sig}')
+
+narinfo_path = os.path.join(cache_dir, f'{hash_prefix}.narinfo')
+with open(narinfo_path, 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+" "$store_path" "$hash" "$nar_file" "$file_size" "$file_hash" "$CACHE_DIR" "$path_info"
+
+        info "  Exported $hash ($(numfmt --to=iec "$file_size" 2>/dev/null || echo "${file_size}B"))"
     done
-    info "Pruned $removed upstream paths from local cache (kept ${#keep_hashes[@]})"
+
+    info "Export complete: ${#paths[@]} paths"
 }
 
 # ── OCI upload pipeline ──────────────────────────────────────────────
@@ -552,13 +592,10 @@ full_pipeline() {
     mapfile -t local_array <<< "$local_paths"
     info "Locally-built paths to cache: ${#local_array[@]}"
 
-    # 5. Export closure (nix copy needs full closure)
-    export_cache "${local_array[@]}"
+    # 5. Export only locally-built paths (direct NAR dump, no full closure)
+    export_paths_directly "${local_array[@]}"
 
-    # 6. Prune upstream paths from export
-    prune_upstream_from_cache "${local_array[@]}"
-
-    # 7. Upload to GHCR
+    # 6. Upload to GHCR
     upload_to_oci "${paths_array[@]}"
 
     info "Pipeline complete!"
