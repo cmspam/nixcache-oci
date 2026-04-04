@@ -11,7 +11,15 @@ echo "Repo: $REPO"
 
 # Fetch the cache index from GHCR
 echo ">>> Fetching cache index from GHCR..."
-TOKEN=$(gh auth token 2>/dev/null || echo "")
+CRED_TOKEN=$(gh auth token 2>/dev/null || echo "")
+# Exchange for OCI registry token
+TOKEN=$(curl -s -u "token:${CRED_TOKEN}" \
+    "https://ghcr.io/token?scope=repository:${REPO}/nix-cache:pull&service=ghcr.io" 2>/dev/null \
+    | jq -r '.token // empty')
+if [[ -z "$TOKEN" ]]; then
+    TOKEN="$CRED_TOKEN"
+fi
+
 MANIFEST=$(curl -fsSL \
     -H "Authorization: Bearer $TOKEN" \
     -H "Accept: application/vnd.oci.image.manifest.v1+json" \
@@ -120,10 +128,13 @@ CONTAINER_SCRIPT
 chmod +x "$PROJECT_DIR/test/run-in-container.sh"
 
 echo ">>> Running test in podman container..."
+# Pass GH token for GHCR access (package may be private)
+GH_TOKEN_FOR_CONTAINER=$(gh auth token 2>/dev/null || echo "")
 podman run --rm \
     -v "$PROJECT_DIR/proxy:/proxy:ro" \
     -v "$PROJECT_DIR/test/run-in-container.sh:/run-test.sh:ro" \
     -e "NIX_CONFIG=experimental-features = nix-command flakes" \
+    -e "GITHUB_TOKEN=${GH_TOKEN_FOR_CONTAINER}" \
     docker.io/nixos/nix:latest \
     bash /run-test.sh "$REPO" "$STORE_HASH"
 

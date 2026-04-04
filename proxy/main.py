@@ -45,10 +45,53 @@ def fetch_url(url: str, headers: dict | None = None, timeout: int = 60) -> bytes
         return None
 
 
-def ghcr_headers() -> dict:
-    h = {"Accept": "application/vnd.oci.image.manifest.v1+json"}
+_oci_token: str = ""
+_oci_token_time: float = 0.0
+
+def get_oci_token() -> str:
+    """Get an OCI registry token, refreshing if needed."""
+    global _oci_token, _oci_token_time
+    if _oci_token and (time.time() - _oci_token_time) < 240:  # refresh every 4 min
+        return _oci_token
+
     if GITHUB_TOKEN:
-        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        # Exchange credentials for OCI registry token
+        scope = f"repository:{REPO}/nix-cache:pull"
+        token_url = f"https://{REGISTRY}/token?scope={scope}&service={REGISTRY}"
+        import base64
+        creds = base64.b64encode(f"token:{GITHUB_TOKEN}".encode()).decode()
+        req = urllib.request.Request(token_url)
+        req.add_header("Authorization", f"Basic {creds}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                _oci_token = data.get("token", GITHUB_TOKEN)
+                _oci_token_time = time.time()
+                return _oci_token
+        except Exception:
+            _oci_token = GITHUB_TOKEN
+            _oci_token_time = time.time()
+            return _oci_token
+
+    # Try anonymous token
+    scope = f"repository:{REPO}/nix-cache:pull"
+    token_url = f"https://{REGISTRY}/token?scope={scope}&service={REGISTRY}"
+    data = fetch_url(token_url)
+    if data:
+        try:
+            _oci_token = json.loads(data).get("token", "")
+            _oci_token_time = time.time()
+            return _oci_token
+        except json.JSONDecodeError:
+            pass
+    return ""
+
+
+def ghcr_headers() -> dict:
+    token = get_oci_token()
+    h = {"Accept": "application/vnd.oci.image.manifest.v1+json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
     return h
 
 
