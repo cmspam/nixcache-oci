@@ -78,15 +78,21 @@ oci_push_blob() {
     fi
 
     # Initiate upload
-    local upload_url
-    upload_url=$(curl -s -D - -o /dev/null \
+    local upload_headers
+    upload_headers=$(mktemp)
+    curl -s -D "$upload_headers" -o /dev/null \
         -X POST \
         -H "Authorization: Bearer $oci_token" \
-        "https://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/uploads/" 2>/dev/null \
-        | grep -i '^location:' | tr -d '\r' | cut -d' ' -f2)
+        "https://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/blobs/uploads/" 2>/dev/null
+
+    local upload_url
+    upload_url=$(grep -i '^location:' "$upload_headers" | tr -d '\r' | sed 's/^[Ll]ocation: *//')
+    local upload_status
+    upload_status=$(head -1 "$upload_headers" | grep -o '[0-9][0-9][0-9]')
+    rm -f "$upload_headers"
 
     if [[ -z "$upload_url" ]]; then
-        err "Failed to initiate blob upload"
+        err "Failed to initiate blob upload (HTTP $upload_status)"
         return 1
     fi
 
