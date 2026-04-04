@@ -1,0 +1,6 @@
+result
+result-*
+.direnv
+__pycache__
+*.pyc
+test/run-in-container.sh

@@ -1,0 +1,64 @@
+name: Update Flake and Rebuild Cache
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'   # weekly, Monday 4am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup signing key
+        run: |
+          if [[ -n "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
+            echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          else
+            nix-store --generate-binary-cache-key nixcache-oci-1 \
+              "$RUNNER_TEMP/signing-key" "$RUNNER_TEMP/signing-key.pub"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Update flake inputs
+        working-directory: config
+        run: |
+          nix flake update
+          echo ">>> Flake inputs updated"
+
+      - name: Commit flake.lock if changed
+        run: |
+          cd config
+          if git diff --quiet flake.lock 2>/dev/null; then
+            echo ">>> No input changes"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add flake.lock
+            git commit -m "config: update flake inputs
+
+          Automated flake update by update-and-cache workflow."
+            git push
+            echo ">>> Committed updated flake.lock"
+          fi
+
+      - name: Build and publish cache
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: config
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source lib/cache-builder.sh
+          full_pipeline

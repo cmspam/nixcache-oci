@@ -1,0 +1,46 @@
+name: Publish Binary Cache
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup signing key
+        run: |
+          if [[ -n "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
+            echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          else
+            echo ">>> No signing key configured, generating ephemeral key"
+            nix-store --generate-binary-cache-key nixcache-oci-1 \
+              "$RUNNER_TEMP/signing-key" "$RUNNER_TEMP/signing-key.pub"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+            echo "::warning::Using ephemeral signing key. Set NIX_SIGNING_KEY secret for persistent signing."
+            echo "Public key: $(cat $RUNNER_TEMP/signing-key.pub)"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish cache
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: config
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source lib/cache-builder.sh
+          full_pipeline

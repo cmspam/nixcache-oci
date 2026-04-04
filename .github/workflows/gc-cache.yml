@@ -1,0 +1,133 @@
+name: Garbage Collect Cache
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # weekly, Sunday 3am UTC
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Delete entries older than N days not in current closure'
+        default: '30'
+        type: string
+      dry_run:
+        description: 'Show what would be deleted without deleting'
+        default: 'true'
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Run garbage collection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: config
+        run: |
+          set -euo pipefail
+          source lib/cache-builder.sh
+
+          RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+
+          echo ">>> Retention: ${RETENTION_DAYS} days (cutoff: ${CUTOFF})"
+          echo ">>> Dry run: ${DRY_RUN}"
+
+          # Build current outputs to find the live set
+          REFS=$(discover_outputs config)
+          OUTPUT_PATHS=$(build_outputs $REFS)
+          LIVE_CLOSURE=$(get_closure $OUTPUT_PATHS)
+          LIVE_HASHES=$(echo "$LIVE_CLOSURE" | xargs -I{} basename {} | cut -c1-32 | sort -u)
+
+          # Get current index
+          oci_get_token
+          existing_manifest=$(oci_get_manifest "cache-index")
+          if [[ -z "$existing_manifest" ]]; then
+            echo ">>> No cache index found, nothing to GC"
+            exit 0
+          fi
+
+          index_digest=$(echo "$existing_manifest" | jq -r '.layers[0].digest // empty')
+          if [[ -z "$index_digest" ]]; then
+            echo ">>> Empty index, nothing to GC"
+            exit 0
+          fi
+
+          INDEX_JSON=$(oci_get_blob "$index_digest")
+
+          # Find entries to delete
+          python3 - "$CUTOFF" "$DRY_RUN" <<PYEOF
+          import json, sys, os
+
+          cutoff = sys.argv[1]
+          dry_run = sys.argv[2] == "true"
+
+          index = json.loads('''${INDEX_JSON}''')
+          live_hashes = set("""${LIVE_HASHES}""".strip().split("\n"))
+
+          to_delete = []
+          to_keep = {}
+
+          for hash_key, entry in index.get("entries", {}).items():
+              added = entry.get("added", "2099-01-01T00:00:00Z")
+              is_live = hash_key in live_hashes
+              is_old = added < cutoff
+
+              if not is_live and is_old:
+                  to_delete.append((hash_key, entry))
+                  print(f"DELETE: {hash_key} ({entry.get('name', '?')}) added={added}")
+              else:
+                  to_keep[hash_key] = entry
+                  reason = "live" if is_live else "recent"
+                  print(f"KEEP:   {hash_key} ({entry.get('name', '?')}) reason={reason}")
+
+          print(f"\n>>> Total: {len(to_keep)} keep, {len(to_delete)} delete")
+
+          if dry_run:
+              print(">>> Dry run, no changes")
+          elif to_delete:
+              index["entries"] = to_keep
+              index["gc_roots"] = [h for h in index.get("gc_roots", []) if h in to_keep]
+              with open(os.environ.get("NIXCACHE_WORK_DIR", "/tmp") + "/gc-index.json", "w") as f:
+                  json.dump(index, f, indent=2, sort_keys=True)
+              print("UPDATED")
+          PYEOF
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            exit 0
+          fi
+
+          if [[ -f "${NIXCACHE_WORK_DIR:-/tmp}/gc-index.json" ]]; then
+            # Re-upload the pruned index
+            INDEX_FILE="${NIXCACHE_WORK_DIR:-/tmp}/gc-index.json"
+            INDEX_DIGEST=$(oci_push_blob "$INDEX_FILE")
+            INDEX_SIZE=$(stat -c%s "$INDEX_FILE")
+
+            CONFIG_FILE=$(mktemp)
+            echo '{}' > "$CONFIG_FILE"
+            CONFIG_DIGEST=$(oci_push_blob "$CONFIG_FILE")
+            CONFIG_SIZE=$(stat -c%s "$CONFIG_FILE")
+
+            MANIFEST=$(jq -n \
+              --arg cd "$CONFIG_DIGEST" --argjson cs "$CONFIG_SIZE" \
+              --arg id "$INDEX_DIGEST" --argjson is "$INDEX_SIZE" \
+              '{schemaVersion:2, mediaType:"application/vnd.oci.image.manifest.v1+json",
+                config:{mediaType:"application/vnd.oci.image.config.v1+json",digest:$cd,size:$cs},
+                layers:[{mediaType:"application/vnd.nix.cache.index.v1+json",digest:$id,size:$is}]}')
+            oci_push_manifest "cache-index" "$MANIFEST"
+            echo ">>> GC complete, index updated"
+            rm -f "$CONFIG_FILE"
+          fi
