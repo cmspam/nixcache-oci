@@ -2,7 +2,7 @@ name: Update Flake and Rebuild Cache
 
 on:
   schedule:
-    - cron: '0 4 * * 1'   # weekly, Monday 4am UTC
+    - cron: '0 4,16 * * *'   # twice daily, 4am and 4pm UTC
   workflow_dispatch:
 
 permissions:
