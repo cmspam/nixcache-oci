@@ -240,12 +240,14 @@ get_closure() {
     nix-store --query --requisites "$@" | sort -u
 }
 
-filter_upstream() {
-    local paths=("$@")
-    local upstream_caches
-    IFS=' ' read -ra upstream_caches <<< "$NIXCACHE_UPSTREAM_CACHES"
+# find_paths_to_cache <flake_refs...> — use nix build --dry-run to determine
+# which paths would need to be built (not available from ANY configured
+# substituter, including our own GHCR proxy if running). This replaces the
+# old approach of curling cache.nixos.org for each path individually.
+find_paths_to_cache() {
+    local refs=("$@")
 
-    # Also load our own GHCR index to check what's already cached there
+    # Also check our own GHCR index for already-cached paths
     local own_index_hashes=""
     oci_get_token 2>/dev/null || true
     local existing_manifest
@@ -258,47 +260,41 @@ filter_upstream() {
                 jq -r '.entries | keys[]' 2>/dev/null || true)
         fi
     fi
-
-    info "Checking ${#paths[@]} paths against upstream caches and own GHCR index"
-
-    local local_only=()
-    local skipped_upstream=0
-    local skipped_own=0
-
-    for store_path in "${paths[@]}"; do
-        local hash
-        hash=$(basename "$store_path" | cut -c1-32)
-
-        # Check our own GHCR index first (fast, local string match)
-        if echo "$own_index_hashes" | grep -qxF "$hash"; then
-            skipped_own=$((skipped_own + 1))
-            continue
-        fi
-
-        # Check upstream caches
-        local found_upstream=false
-        for cache_url in "${upstream_caches[@]}"; do
-            local http_code
-            http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-                "${cache_url}/${hash}.narinfo" 2>/dev/null || echo "000")
-            if [[ "$http_code" == "200" ]]; then
-                found_upstream=true
-                break
-            fi
-        done
-
-        if [[ "$found_upstream" == "true" ]]; then
-            skipped_upstream=$((skipped_upstream + 1))
-        else
-            local_only+=("$store_path")
-        fi
-    done
-
-    info "Already cached (GHCR): ${skipped_own}, upstream: ${skipped_upstream}, new to build: ${#local_only[@]}"
-
-    if [[ ${#local_only[@]} -gt 0 ]]; then
-        printf '%s\n' "${local_only[@]}"
+    local own_count=0
+    if [[ -n "$own_index_hashes" ]]; then
+        own_count=$(echo "$own_index_hashes" | wc -l)
     fi
+    info "Own GHCR index has $own_count cached entries"
+
+    # Use --dry-run to find what Nix would build vs fetch.
+    # This respects ALL configured substituters (cache.nixos.org, our proxy, user caches)
+    info "Running dry-run to determine what needs building..."
+    local dry_output
+    dry_output=$(mktemp)
+
+    for ref in "${refs[@]}"; do
+        nix build "$ref" --no-link --dry-run 2>"$dry_output" || true
+
+        # Parse "these N paths will be built:" section from stderr
+        local will_build
+        will_build=$(sed -n '/will be built:/,/^$/{ /\/nix\/store/p }' "$dry_output" | \
+            sed 's/^[[:space:]]*//' | sort -u)
+
+        if [[ -n "$will_build" ]]; then
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                local hash
+                hash=$(basename "$path" | cut -c1-32)
+                # Skip if already in our GHCR index
+                if [[ -n "$own_index_hashes" ]] && echo "$own_index_hashes" | grep -qxF "$hash"; then
+                    continue
+                fi
+                echo "$path"
+            done <<< "$will_build"
+        fi
+    done | sort -u
+
+    rm -f "$dry_output"
 }
 
 # export_paths_directly <store_paths...> — export only the given paths as NARs
@@ -412,6 +408,7 @@ upload_to_oci() {
 
     local new_entries="{}"
     local uploaded=0
+    local upload_failures=0
 
     for narinfo in "$CACHE_DIR"/*.narinfo; do
         [[ -f "$narinfo" ]] || continue
@@ -438,6 +435,7 @@ upload_to_oci() {
         local nar_digest
         nar_digest=$(oci_push_blob "$nar_file") || {
             err "Failed to upload NAR for $hash"
+            upload_failures=$((upload_failures + 1))
             continue
         }
 
@@ -467,6 +465,10 @@ print(json.dumps(entries))
     if [[ "$uploaded" -eq 0 ]]; then
         info "No new paths to upload"
         return 0
+    fi
+
+    if [[ "$upload_failures" -gt 0 ]]; then
+        err "$upload_failures upload(s) failed. Updating index with $uploaded successful upload(s) only."
     fi
 
     info "Uploaded $uploaded NAR(s), updating index"
@@ -653,7 +655,17 @@ full_pipeline() {
     info "Discovered ${#refs_array[@]} output(s) to build"
     printf '    %s\n' "${refs_array[@]}" >&2
 
-    # 2. Build all outputs (Nix will pull cached paths from our proxy + upstream)
+    # 2. Determine what would need building vs what's already cached
+    #    Uses --dry-run which respects ALL configured substituters
+    local needs_building
+    needs_building=$(find_paths_to_cache "${refs_array[@]}")
+    local needs_count=0
+    if [[ -n "$needs_building" ]]; then
+        needs_count=$(echo "$needs_building" | wc -l)
+    fi
+    info "Paths needing build (not in any cache): $needs_count"
+
+    # 3. Build all outputs (Nix fetches cached paths from substituters)
     local output_paths
     output_paths=$(build_outputs "${refs_array[@]}")
     local paths_array
@@ -663,29 +675,40 @@ full_pipeline() {
     # Done with self-substituter
     stop_self_substituter
 
-    # 3. Get closure
-    local closure
-    closure=$(get_closure "${paths_array[@]}")
-    local closure_array
-    mapfile -t closure_array <<< "$closure"
-    info "Full closure: ${#closure_array[@]} store paths"
-
-    # 4. Filter upstream (checks cache.nixos.org AND our own GHCR cache)
-    local local_paths
-    local_paths=$(filter_upstream "${closure_array[@]}")
-    if [[ -z "$local_paths" ]]; then
-        info "All closure paths are available upstream — nothing to upload"
+    # 4. Determine what to upload: paths that were actually built locally
+    #    (not fetched from any substituter)
+    if [[ -z "$needs_building" ]]; then
+        info "All paths were available from caches — nothing new to upload"
+        write_summary "${#refs_array[@]}" 0 0 "${#paths_array[@]}"
         return 0
     fi
     local local_array
-    mapfile -t local_array <<< "$local_paths"
-    info "Locally-built paths to cache: ${#local_array[@]}"
+    mapfile -t local_array <<< "$needs_building"
+    info "New paths to cache: ${#local_array[@]}"
 
-    # 5. Export only locally-built paths (direct NAR dump, no full closure)
+    # 5. Export only the new paths (direct NAR dump)
     export_paths_directly "${local_array[@]}"
 
     # 6. Upload to GHCR
     upload_to_oci "${paths_array[@]}"
 
+    write_summary "${#refs_array[@]}" "${#local_array[@]}" "${#local_array[@]}" "${#paths_array[@]}"
     info "Pipeline complete!"
+}
+
+# Write a GitHub Actions step summary if available
+write_summary() {
+    local outputs="$1" new_paths="$2" uploaded="$3" total_outputs="$4"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+## Cache Build Summary
+
+| Metric | Count |
+|---|---|
+| Flake outputs discovered | $outputs |
+| Output paths built | $total_outputs |
+| New paths cached to GHCR | $new_paths |
+| Paths already cached | skipped |
+EOF
+    fi
 }

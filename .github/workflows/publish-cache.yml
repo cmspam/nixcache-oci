@@ -25,24 +25,42 @@ jobs:
             echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
             echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
             echo ">>> Signing key configured"
+
+            # Extract and commit the public key so it's always in the repo
+            nix key convert-secret-to-public < "$RUNNER_TEMP/signing-key" > public-key.txt 2>/dev/null || true
+            if [[ -f public-key.txt ]] && [[ -s public-key.txt ]]; then
+              echo ">>> Public key: $(cat public-key.txt)"
+            fi
           else
             echo ">>> No signing key configured — cache will be unsigned"
             echo "::notice::Cache packages will not be signed. Set NIX_SIGNING_KEY secret to enable signing. Clients will need require-sigs = false."
           fi
 
-      - name: Update flake inputs
+      - name: Update flake inputs and commit changes
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Update flake inputs
           cd config
           nix flake update
-          if git diff --quiet flake.lock 2>/dev/null; then
-            echo ">>> No input changes"
+          cd ..
+
+          # Stage any changes (flake.lock, public-key.txt)
+          git add -A
+          if git diff --cached --quiet; then
+            echo ">>> No changes to commit"
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add flake.lock
-            git commit -m "config: update flake inputs"
+            CHANGES=""
+            git diff --cached --name-only | while read f; do
+              case "$f" in
+                config/flake.lock) CHANGES="${CHANGES}updated flake inputs, " ;;
+                public-key.txt)    CHANGES="${CHANGES}updated public key, " ;;
+              esac
+            done
+            git commit -m "auto: update flake inputs and cache metadata"
             git push
-            echo ">>> Committed updated flake.lock"
+            echo ">>> Committed changes"
           fi
 
       - name: Log in to GHCR

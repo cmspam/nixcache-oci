@@ -41,6 +41,8 @@ Signing is optional but recommended. It lets Nix verify that packages haven't be
 
 If you don't set a `NIX_SIGNING_KEY` secret, the cache works but packages are unsigned. Clients must disable signature verification:
 
+> **Warning:** `require-sigs = false` and `requireSignatures = false` disable signature checking for **all** substituters, not just this cache. This means packages from cache.nixos.org and any other caches will also be accepted without signature verification. This is fine for personal use or testing, but for shared or production systems, set up proper signing instead.
+
 **NixOS module:**
 ```nix
 services.nixcache-proxy = {
@@ -96,6 +98,8 @@ extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ```
 
 **Auto-discovery** (for scripts): the proxy serves the public key at `http://localhost:37515/public-key` if one was configured during publishing.
+
+The public key is also automatically committed to `public-key.txt` in the repo root when the workflow runs, so you always have a copy.
 
 ### Automated updates
 

@@ -14,6 +14,8 @@
     let pkgs = nixpkgs.legacyPackages.${system};
     in {
       default = pkgs.hello;
+      htop = pkgs.htop;
+      tree = pkgs.tree;
 
       # Custom package that won't be on cache.nixos.org
       nixcache-test = pkgs.writeShellScriptBin "nixcache-test" ''
