@@ -31,11 +31,30 @@ Uses GitHub Container Registry (GHCR) as a storage backend — NARs are stored a
 
 2. Push to `main`. The workflow auto-discovers all outputs, builds them, and uploads only what's not already on cache.nixos.org.
 
-3. Optionally set `NIX_SIGNING_KEY` secret for persistent cache signing:
-   ```bash
-   nix-store --generate-binary-cache-key my-cache-1 signing-key signing-key.pub
-   # Add contents of signing-key as the NIX_SIGNING_KEY repo secret
-   ```
+3. Set up signing (see [Signing](#signing) below).
+
+### Signing
+
+Nix requires cache signatures to verify that downloaded packages haven't been tampered with. Without a signing key, clients would need `require-sigs = false`, which is insecure.
+
+**Generate a key pair** (do this once):
+```bash
+nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
+```
+
+**Store the private key** as a GitHub Actions secret named `NIX_SIGNING_KEY`:
+```bash
+# Copy the contents of secret.key into your repo's Settings > Secrets > Actions
+cat secret.key
+```
+
+**Distribute the public key** to clients. The key looks like `my-cache-1:BASE64...=`. Clients need this to verify signatures. You have several options:
+
+- **NixOS module**: set `services.nixcache-proxy.publicKey = "my-cache-1:...";`
+- **Manual nix.conf**: add `trusted-public-keys = my-cache-1:... cache.nixos.org-1:...`
+- **Auto-discovery**: the proxy exposes the key at `http://localhost:37515/public-key` (fetched from the cache index)
+
+If no `NIX_SIGNING_KEY` secret is set, the workflow generates an ephemeral key per run. This is fine for testing but signatures won't be verifiable across builds.
 
 ### Automated updates
 
@@ -48,13 +67,19 @@ Trigger manually anytime: `gh workflow run update-and-cache.yml`
 
 ### Consuming (client)
 
-**Run the proxy:**
+**Option A — Run the proxy manually:**
 ```bash
 nix run github:cmspam/nixcache-oci#cache-proxy &
-# Nix automatically uses the cache + upstream fallback
 ```
 
-**NixOS module (persistent):**
+Then add to `~/.config/nix/nix.conf` or `/etc/nix/nix.conf`:
+```ini
+extra-substituters = http://localhost:37515
+extra-trusted-substituters = http://localhost:37515
+extra-trusted-public-keys = my-cache-1:BASE64KEY...=
+```
+
+**Option B — NixOS module (persistent, recommended):**
 ```nix
 {
   inputs.nixcache.url = "github:cmspam/nixcache-oci";
@@ -62,12 +87,19 @@ nix run github:cmspam/nixcache-oci#cache-proxy &
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       modules = [
         nixcache.nixosModules.default
-        { services.nixcache-proxy.enable = true; }
+        {
+          services.nixcache-proxy = {
+            enable = true;
+            publicKey = "my-cache-1:BASE64KEY...=";
+          };
+        }
       ];
     };
   };
 }
 ```
+
+This starts the proxy as a systemd service and configures Nix's substituters and trusted keys automatically.
 
 ### Proxy configuration
 
@@ -78,6 +110,8 @@ nix run github:cmspam/nixcache-oci#cache-proxy &
 | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | Upstream cache URLs (space-separated) |
 | `GITHUB_TOKEN` | (none) | Token for private repos |
 | `NIXCACHE_INDEX_TTL` | `300` | Index refresh interval (seconds) |
+
+The proxy also exposes `GET /public-key` which returns the cache's public signing key (if configured), useful for automated setup scripts.
 
 ## Architecture
 

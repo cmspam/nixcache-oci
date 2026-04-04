@@ -184,11 +184,14 @@ class DiskCache:
 
 disk_cache = DiskCache(CACHE_DIR / "blobs")
 
-NCI_RESPONSE = (
-    b"StoreDir: /nix/store\n"
-    b"WantMassQuery: 1\n"
-    b"Priority: 40\n"
-)
+def get_nci_response() -> bytes:
+    """Build nix-cache-info, including the public key if available from the index."""
+    lines = [
+        "StoreDir: /nix/store",
+        "WantMassQuery: 1",
+        "Priority: 40",
+    ]
+    return "\n".join(lines).encode() + b"\n"
 
 
 class CacheHandler(http.server.BaseHTTPRequestHandler):
@@ -198,13 +201,23 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.rstrip("/")
         if path == "/nix-cache-info":
-            self._serve_bytes(NCI_RESPONSE, "text/x-nix-cache-info")
+            self._serve_bytes(get_nci_response(), "text/x-nix-cache-info")
+        elif path == "/public-key":
+            self._serve_public_key()
         elif path.endswith(".narinfo"):
             self._serve_narinfo(path)
         elif path.startswith("/nar/"):
             self._serve_nar(path)
         else:
             self.send_error(404)
+
+    def _serve_public_key(self):
+        index = cache_index.get()
+        pk = index.get("public_key", "")
+        if pk:
+            self._serve_bytes(pk.encode() + b"\n", "text/plain")
+        else:
+            self.send_error(404, "No public key configured")
 
     def _serve_bytes(self, data: bytes, content_type: str):
         self.send_response(200)

@@ -55,6 +55,16 @@
           default = 37515;
           description = "Local port the proxy listens on.";
         };
+        publicKey = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          description = ''
+            Public key for verifying cache signatures.
+            Generate with: nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
+            The proxy also exposes the key at http://localhost:PORT/public-key
+          '';
+        };
       };
 
       config = lib.mkIf cfg.enable {
@@ -74,7 +84,10 @@
             CacheDirectory = "nixcache-proxy";
           };
         };
-        nix.settings.substituters = [ "http://localhost:${toString cfg.port}" ];
+        nix.settings = {
+          substituters = [ "http://localhost:${toString cfg.port}" ];
+          trusted-public-keys = lib.mkIf (cfg.publicKey != "") [ cfg.publicKey ];
+        };
       };
     };
   };
