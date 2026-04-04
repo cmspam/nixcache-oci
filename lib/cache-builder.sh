@@ -245,16 +245,38 @@ filter_upstream() {
     local upstream_caches
     IFS=' ' read -ra upstream_caches <<< "$NIXCACHE_UPSTREAM_CACHES"
 
-    info "Checking ${#paths[@]} paths against upstream caches"
+    # Also load our own GHCR index to check what's already cached there
+    local own_index_hashes=""
+    oci_get_token 2>/dev/null || true
+    local existing_manifest
+    existing_manifest=$(oci_get_manifest "cache-index" 2>/dev/null)
+    if [[ -n "$existing_manifest" ]]; then
+        local index_digest
+        index_digest=$(echo "$existing_manifest" | jq -r '.layers[0].digest // empty' 2>/dev/null)
+        if [[ -n "$index_digest" ]]; then
+            own_index_hashes=$(oci_get_blob "$index_digest" 2>/dev/null | \
+                jq -r '.entries | keys[]' 2>/dev/null || true)
+        fi
+    fi
+
+    info "Checking ${#paths[@]} paths against upstream caches and own GHCR index"
 
     local local_only=()
-    local skipped=0
+    local skipped_upstream=0
+    local skipped_own=0
 
     for store_path in "${paths[@]}"; do
         local hash
         hash=$(basename "$store_path" | cut -c1-32)
-        local found_upstream=false
 
+        # Check our own GHCR index first (fast, local string match)
+        if echo "$own_index_hashes" | grep -qxF "$hash"; then
+            skipped_own=$((skipped_own + 1))
+            continue
+        fi
+
+        # Check upstream caches
+        local found_upstream=false
         for cache_url in "${upstream_caches[@]}"; do
             local http_code
             http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
@@ -266,13 +288,13 @@ filter_upstream() {
         done
 
         if [[ "$found_upstream" == "true" ]]; then
-            skipped=$((skipped + 1))
+            skipped_upstream=$((skipped_upstream + 1))
         else
             local_only+=("$store_path")
         fi
     done
 
-    info "Upstream: ${skipped} available, ${#local_only[@]} locally-built"
+    info "Already cached (GHCR): ${skipped_own}, upstream: ${skipped_upstream}, new to build: ${#local_only[@]}"
 
     if [[ ${#local_only[@]} -gt 0 ]]; then
         printf '%s\n' "${local_only[@]}"
@@ -549,17 +571,75 @@ json.dump(index, open('$index_file', 'w'), indent=2, sort_keys=True)
 
 # ── Main pipeline ─────────────────────────────────────────────────────
 
+# start_self_substituter — start the proxy on the CI runner so that Nix can
+# pull previously-cached paths from our own GHCR cache instead of rebuilding.
+# This avoids recompiling packages that haven't changed between runs.
+start_self_substituter() {
+    info "Starting self-substituter to reuse previously cached builds"
+
+    # The proxy script is at proxy/main.py relative to the repo root
+    local proxy_script
+    proxy_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/proxy/main.py"
+    if [[ ! -f "$proxy_script" ]]; then
+        info "Proxy script not found at $proxy_script, skipping self-substitution"
+        return 0
+    fi
+
+    NIXCACHE_REPO="$NIXCACHE_REPO" \
+    NIXCACHE_PORT=37515 \
+    NIXCACHE_LISTEN=127.0.0.1 \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
+        python3 "$proxy_script" &
+    SELF_PROXY_PID=$!
+
+    # Wait for it to be ready
+    local ready=false
+    for i in $(seq 1 15); do
+        if curl -fs --max-time 2 http://127.0.0.1:37515/nix-cache-info >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$ready" == "true" ]]; then
+        info "Self-substituter running (pid=$SELF_PROXY_PID)"
+        # Configure Nix to use our own cache during builds
+        mkdir -p /etc/nix
+        cat >> /etc/nix/nix.conf <<EOF
+extra-substituters = http://127.0.0.1:37515
+extra-trusted-substituters = http://127.0.0.1:37515
+EOF
+    else
+        info "Self-substituter failed to start, continuing without it"
+        kill "$SELF_PROXY_PID" 2>/dev/null || true
+        SELF_PROXY_PID=""
+    fi
+}
+
+stop_self_substituter() {
+    if [[ -n "${SELF_PROXY_PID:-}" ]]; then
+        kill "$SELF_PROXY_PID" 2>/dev/null || true
+        info "Self-substituter stopped"
+    fi
+}
+
 full_pipeline() {
     local flake_dir="${NIXCACHE_CONFIG_DIR}"
 
     info "Starting OCI cache pipeline"
     info "Config: $flake_dir | Image: $NIXCACHE_IMAGE"
 
+    # 0. Start our own cache as a substituter to reuse previous builds
+    SELF_PROXY_PID=""
+    start_self_substituter
+
     # 1. Discover outputs
     local discovered
     discovered=$(discover_outputs "$flake_dir")
     if [[ -z "$discovered" ]]; then
         err "No buildable outputs found in $flake_dir"
+        stop_self_substituter
         return 1
     fi
     local refs_array
@@ -567,12 +647,15 @@ full_pipeline() {
     info "Discovered ${#refs_array[@]} output(s) to build"
     printf '    %s\n' "${refs_array[@]}" >&2
 
-    # 2. Build all outputs
+    # 2. Build all outputs (Nix will pull cached paths from our proxy + upstream)
     local output_paths
     output_paths=$(build_outputs "${refs_array[@]}")
     local paths_array
     mapfile -t paths_array <<< "$output_paths"
     info "Built ${#paths_array[@]} output path(s)"
+
+    # Done with self-substituter
+    stop_self_substituter
 
     # 3. Get closure
     local closure
@@ -581,7 +664,7 @@ full_pipeline() {
     mapfile -t closure_array <<< "$closure"
     info "Full closure: ${#closure_array[@]} store paths"
 
-    # 4. Filter upstream
+    # 4. Filter upstream (checks cache.nixos.org AND our own GHCR cache)
     local local_paths
     local_paths=$(filter_upstream "${closure_array[@]}")
     if [[ -z "$local_paths" ]]; then
