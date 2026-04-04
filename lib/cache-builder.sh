@@ -25,24 +25,35 @@ err()  { echo "!!! $*" >&2; }
 
 # ── OCI registry helpers ──────────────────────────────────────────────
 
-# Get a GHCR auth token for the package
+# Get a GHCR auth token via OCI token exchange
 oci_token=""
 oci_get_token() {
     if [[ -n "$oci_token" ]]; then return; fi
-    # Use GITHUB_TOKEN if available (Actions), else try gh auth
-    local token
+
+    local cred_token
     if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        token="$GITHUB_TOKEN"
+        cred_token="$GITHUB_TOKEN"
     elif [[ -n "${GH_TOKEN:-}" ]]; then
-        token="$GH_TOKEN"
+        cred_token="$GH_TOKEN"
     else
-        token=$(gh auth token 2>/dev/null) || true
+        cred_token=$(gh auth token 2>/dev/null) || true
     fi
-    if [[ -z "$token" ]]; then
+    if [[ -z "$cred_token" ]]; then
         err "No authentication token available for GHCR"
         return 1
     fi
-    oci_token="$token"
+
+    # Exchange credentials for an OCI registry token
+    local scope="repository:${NIXCACHE_REPO}/nix-cache:pull,push"
+    local token_response
+    token_response=$(curl -s -u "token:${cred_token}" \
+        "https://${NIXCACHE_REGISTRY}/token?scope=${scope}&service=${NIXCACHE_REGISTRY}" 2>/dev/null)
+    oci_token=$(echo "$token_response" | jq -r '.token // empty' 2>/dev/null)
+
+    if [[ -z "$oci_token" ]]; then
+        # Fallback: try using the credential directly (some registries accept this)
+        oci_token="$cred_token"
+    fi
 }
 
 # Push a blob to the OCI registry, returns the digest
