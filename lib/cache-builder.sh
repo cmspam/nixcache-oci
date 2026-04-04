@@ -605,11 +605,17 @@ start_self_substituter() {
     if [[ "$ready" == "true" ]]; then
         info "Self-substituter running (pid=$SELF_PROXY_PID)"
         # Configure Nix to use our own cache during builds
-        mkdir -p /etc/nix
-        cat >> /etc/nix/nix.conf <<EOF
+        # Try system config first, fall back to user config
+        local nix_conf="/etc/nix/nix.conf"
+        if [[ ! -w "$nix_conf" ]] && [[ ! -w "$(dirname "$nix_conf")" ]]; then
+            nix_conf="${HOME}/.config/nix/nix.conf"
+            mkdir -p "$(dirname "$nix_conf")"
+        fi
+        cat >> "$nix_conf" <<EOF
 extra-substituters = http://127.0.0.1:37515
 extra-trusted-substituters = http://127.0.0.1:37515
 EOF
+        info "Added self-substituter to $nix_conf"
     else
         info "Self-substituter failed to start, continuing without it"
         kill "$SELF_PROXY_PID" 2>/dev/null || true
