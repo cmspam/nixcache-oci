@@ -66,17 +66,25 @@ jobs:
             exit 0
           fi
 
-          INDEX_JSON=$(oci_get_blob "$index_digest")
+          INDEX_FILE="/tmp/gc-current-index.json"
+          oci_get_blob "$index_digest" > "$INDEX_FILE"
+
+          LIVE_HASHES_FILE="/tmp/gc-live-hashes.txt"
+          echo "$LIVE_HASHES" > "$LIVE_HASHES_FILE"
 
           # Find entries to delete
-          python3 - "$CUTOFF" "$DRY_RUN" <<PYEOF
+          python3 - "$CUTOFF" "$DRY_RUN" "$INDEX_FILE" "$LIVE_HASHES_FILE" <<'PYEOF'
           import json, sys, os
 
           cutoff = sys.argv[1]
           dry_run = sys.argv[2] == "true"
+          index_file = sys.argv[3]
+          live_hashes_file = sys.argv[4]
 
-          index = json.loads('''${INDEX_JSON}''')
-          live_hashes = set("""${LIVE_HASHES}""".strip().split("\n"))
+          with open(index_file) as f:
+              index = json.load(f)
+          with open(live_hashes_file) as f:
+              live_hashes = set(f.read().strip().split("\n"))
 
           to_delete = []
           to_keep = {}
@@ -101,7 +109,7 @@ jobs:
           elif to_delete:
               index["entries"] = to_keep
               index["gc_roots"] = [h for h in index.get("gc_roots", []) if h in to_keep]
-              with open(os.environ.get("NIXCACHE_WORK_DIR", "/tmp") + "/gc-index.json", "w") as f:
+              with open("/tmp/gc-updated-index.json", "w") as f:
                   json.dump(index, f, indent=2, sort_keys=True)
               print("UPDATED")
           PYEOF
@@ -110,9 +118,9 @@ jobs:
             exit 0
           fi
 
-          if [[ -f "${NIXCACHE_WORK_DIR:-/tmp}/gc-index.json" ]]; then
+          if [[ -f "/tmp/gc-updated-index.json" ]]; then
             # Re-upload the pruned index
-            INDEX_FILE="${NIXCACHE_WORK_DIR:-/tmp}/gc-index.json"
+            INDEX_FILE="/tmp/gc-updated-index.json"
             INDEX_DIGEST=$(oci_push_blob "$INDEX_FILE")
             INDEX_SIZE=$(stat -c%s "$INDEX_FILE")
 
