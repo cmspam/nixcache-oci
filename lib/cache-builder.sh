@@ -217,10 +217,9 @@ build_outputs() {
     local all_paths=()
     for ref in "${refs[@]}"; do
         info "Building $ref"
-        # Build with verbose output (stderr shown in CI logs), JSON to file
         local json_file
         json_file=$(mktemp)
-        nix build "$ref" --no-link --json > "$json_file" 2>&2 || {
+        nix build "$ref" --no-link --accept-flake-config --json > "$json_file" 2>&2 || {
             err "Failed to build $ref"
             rm -f "$json_file"
             return 1
@@ -238,63 +237,6 @@ build_outputs() {
 
 get_closure() {
     nix-store --query --requisites "$@" | sort -u
-}
-
-# find_paths_to_cache <flake_refs...> — use nix build --dry-run to determine
-# which paths would need to be built (not available from ANY configured
-# substituter, including our own GHCR proxy if running). This replaces the
-# old approach of curling cache.nixos.org for each path individually.
-find_paths_to_cache() {
-    local refs=("$@")
-
-    # Also check our own GHCR index for already-cached paths
-    local own_index_hashes=""
-    oci_get_token 2>/dev/null || true
-    local existing_manifest
-    existing_manifest=$(oci_get_manifest "cache-index" 2>/dev/null)
-    if [[ -n "$existing_manifest" ]]; then
-        local index_digest
-        index_digest=$(echo "$existing_manifest" | jq -r '.layers[0].digest // empty' 2>/dev/null)
-        if [[ -n "$index_digest" ]]; then
-            own_index_hashes=$(oci_get_blob "$index_digest" 2>/dev/null | \
-                jq -r '.entries | keys[]' 2>/dev/null || true)
-        fi
-    fi
-    local own_count=0
-    if [[ -n "$own_index_hashes" ]]; then
-        own_count=$(echo "$own_index_hashes" | wc -l)
-    fi
-    info "Own GHCR index has $own_count cached entries"
-
-    # Use --dry-run to find what Nix would build vs fetch.
-    # This respects ALL configured substituters (cache.nixos.org, our proxy, user caches)
-    info "Running dry-run to determine what needs building..."
-    local dry_output
-    dry_output=$(mktemp)
-
-    for ref in "${refs[@]}"; do
-        nix build "$ref" --no-link --dry-run 2>"$dry_output" || true
-
-        # Parse "these N paths will be built:" section from stderr
-        local will_build
-        will_build=$(sed -n '/will be built:/,/^$/{ /\/nix\/store/p }' "$dry_output" | \
-            sed 's/^[[:space:]]*//' | sort -u)
-
-        if [[ -n "$will_build" ]]; then
-            while IFS= read -r path; do
-                [[ -n "$path" ]] || continue
-                local hash
-                hash=$(basename "$path" | cut -c1-32)
-                # Skip if already in our GHCR index
-                if [[ -n "$own_index_hashes" ]] && echo "$own_index_hashes" | grep -qxF "$hash"; then
-                    continue
-                fi
-                echo "$path"
-            done <<< "$will_build"
-        fi
-    done | sort -u
-
-    rm -f "$dry_output"
 }
 
 # export_paths_directly <store_paths...> — export only the given paths as NARs
@@ -390,23 +332,31 @@ with open(narinfo_path, 'w') as f:
 
 # ── OCI upload pipeline ──────────────────────────────────────────────
 
-# Upload all locally-built paths to GHCR as OCI artifacts
+# Upload all locally-built paths to GHCR as OCI artifacts.
+# State that could grow past ARG_MAX (the existing index, per-path receipts)
+# is passed via files, not argv — otherwise a few hundred uploads blow past
+# the exec limit.
 upload_to_oci() {
     info "Uploading to GHCR: ${NIXCACHE_IMAGE}"
 
-    # Download existing index if any
-    local existing_index="{}"
+    # Download existing index to a file.
+    local existing_index_file="$NIXCACHE_WORK_DIR/existing-index.json"
+    echo '{}' > "$existing_index_file"
     local existing_manifest
     existing_manifest=$(oci_get_manifest "cache-index")
     if [[ -n "$existing_manifest" ]]; then
         local index_digest
         index_digest=$(echo "$existing_manifest" | jq -r '.layers[0].digest // empty' 2>/dev/null)
         if [[ -n "$index_digest" ]]; then
-            existing_index=$(oci_get_blob "$index_digest" 2>/dev/null || echo "{}")
+            oci_get_blob "$index_digest" > "$existing_index_file" 2>/dev/null \
+                || echo '{}' > "$existing_index_file"
         fi
     fi
 
-    local new_entries="{}"
+    # Per-upload receipts go to a JSONL file.
+    local receipts_file="$NIXCACHE_WORK_DIR/uploads.jsonl"
+    : > "$receipts_file"
+
     local uploaded=0
     local upload_failures=0
 
@@ -414,10 +364,7 @@ upload_to_oci() {
         [[ -f "$narinfo" ]] || continue
         local hash
         hash=$(basename "$narinfo" .narinfo)
-        local narinfo_content
-        narinfo_content=$(cat "$narinfo")
 
-        # Find the NAR file
         local nar_url
         nar_url=$(grep '^URL: ' "$narinfo" | head -1 | cut -d' ' -f2)
         local nar_file="$CACHE_DIR/$nar_url"
@@ -430,7 +377,6 @@ upload_to_oci() {
         local nar_size
         nar_size=$(stat -c%s "$nar_file")
 
-        # Push NAR blob
         info "  Uploading NAR for $hash ($(numfmt --to=iec "$nar_size" 2>/dev/null || echo "${nar_size}B"))"
         local nar_digest
         nar_digest=$(oci_push_blob "$nar_file") || {
@@ -439,25 +385,14 @@ upload_to_oci() {
             continue
         }
 
-        # Store entry in index
-        local store_path
-        store_path=$(grep '^StorePath: ' "$narinfo" | head -1 | cut -d' ' -f2)
-        local name
-        name=$(basename "$store_path" | sed 's/^[a-z0-9]*-//')
-
-        # Use python to properly handle narinfo with newlines in JSON
-        new_entries=$(python3 -c "
-import json, sys
-entries = json.loads(sys.argv[1])
-entries[sys.argv[2]] = {
-    'name': sys.argv[3],
-    'narinfo': open(sys.argv[4]).read(),
-    'nar_digest': sys.argv[5],
-    'nar_size': int(sys.argv[6]),
-    'added': sys.argv[7]
-}
-print(json.dumps(entries))
-" "$new_entries" "$hash" "$name" "$narinfo" "$nar_digest" "$nar_size" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+        # Append one-line JSON receipt; the final index-build reads these.
+        jq -n -c \
+            --arg hash "$hash" \
+            --arg narinfo_file "$narinfo" \
+            --arg nar_digest "$nar_digest" \
+            --argjson nar_size "$nar_size" \
+            '{hash: $hash, narinfo_file: $narinfo_file, nar_digest: $nar_digest, nar_size: $nar_size}' \
+            >> "$receipts_file"
 
         uploaded=$((uploaded + 1))
     done
@@ -472,64 +407,108 @@ print(json.dumps(entries))
     fi
 
     info "Uploaded $uploaded NAR(s), updating index"
-    update_cache_index "$existing_index" "$new_entries" "$@"
+    update_cache_index "$existing_index_file" "$receipts_file" "$@"
 }
 
-# Update the cache-index manifest with new entries
-# update_cache_index <existing_json> <new_entries_json> <gc_root_paths...>
+# Update the cache-index manifest with new entries.
+# update_cache_index <existing_index_file> <receipts_file> <gc_root_paths...>
 update_cache_index() {
-    local existing_index="$1"
-    local new_entries="$2"
+    local existing_index_file="$1"
+    local receipts_file="$2"
     shift 2
     local gc_root_paths=("$@")
 
-    local gc_roots="[]"
+    # Collect gc-root hashes into a file.
+    local gc_roots_file="$NIXCACHE_WORK_DIR/gc-roots.json"
+    local gc_json="[]"
     for p in "${gc_root_paths[@]}"; do
         local h
         h=$(basename "$p" | cut -c1-32)
-        gc_roots=$(echo "$gc_roots" | jq --arg h "$h" '. + [$h]')
+        gc_json=$(echo "$gc_json" | jq -c --arg h "$h" '. + [$h]')
     done
+    printf '%s' "$gc_json" > "$gc_roots_file"
 
     local public_key=""
     if [[ -n "$NIXCACHE_SIGNING_KEY_FILE" ]] && [[ -f "${NIXCACHE_SIGNING_KEY_FILE}.pub" ]]; then
         public_key=$(cat "${NIXCACHE_SIGNING_KEY_FILE}.pub")
     fi
 
-    # Merge indices
+    # Build the merged index in one Python run, reading large inputs from
+    # files/env so argv stays tiny regardless of how many entries there are.
     local index_file="$NIXCACHE_WORK_DIR/cache-index.json"
-    python3 -c "
-import json, sys
+    EXISTING_INDEX_FILE="$existing_index_file" \
+    RECEIPTS_FILE="$receipts_file" \
+    GC_ROOTS_FILE="$gc_roots_file" \
+    OUTPUT_FILE="$index_file" \
+    PUBLIC_KEY="$public_key" \
+    NIXCACHE_REPO="$NIXCACHE_REPO" \
+    NIXCACHE_REGISTRY="$NIXCACHE_REGISTRY" \
+    NIXCACHE_IMAGE="$NIXCACHE_IMAGE" \
+    GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    python3 <<'PYEOF'
+import json, os
 
-existing = json.loads(sys.argv[1])
-new_entries = json.loads(sys.argv[2])
-gc_roots = json.loads(sys.argv[3])
-public_key = sys.argv[4]
-repo = sys.argv[5]
+with open(os.environ["EXISTING_INDEX_FILE"]) as f:
+    try:
+        existing = json.load(f)
+    except json.JSONDecodeError:
+        existing = {}
+
+with open(os.environ["GC_ROOTS_FILE"]) as f:
+    new_gc_roots = json.load(f)
+
+new_entries = {}
+with open(os.environ["RECEIPTS_FILE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        with open(r["narinfo_file"]) as nf:
+            narinfo = nf.read()
+        store_path = ""
+        for l in narinfo.splitlines():
+            if l.startswith("StorePath: "):
+                store_path = l[len("StorePath: "):].strip()
+                break
+        name = (
+            os.path.basename(store_path).split("-", 1)[-1]
+            if store_path else r["hash"]
+        )
+        new_entries[r["hash"]] = {
+            "name": name,
+            "narinfo": narinfo,
+            "nar_digest": r["nar_digest"],
+            "nar_size": int(r["nar_size"]),
+            "added": os.environ["GENERATED_AT"],
+        }
 
 index = {
-    'version': 1,
-    'repo': repo,
-    'registry': '${NIXCACHE_REGISTRY}',
-    'image': '${NIXCACHE_IMAGE}',
-    'generated': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-    'public_key': public_key,
-    'entries': {},
-    'gc_roots': []
+    "version": 1,
+    "repo": os.environ["NIXCACHE_REPO"],
+    "registry": os.environ["NIXCACHE_REGISTRY"],
+    "image": os.environ["NIXCACHE_IMAGE"],
+    "generated": os.environ["GENERATED_AT"],
+    "public_key": os.environ["PUBLIC_KEY"] or existing.get("public_key", ""),
+    "entries": {},
+    "gc_roots": [],
 }
 
-if 'entries' in existing:
-    index['entries'].update(existing['entries'])
-if 'gc_roots' in existing:
-    index['gc_roots'] = existing['gc_roots']
+index["entries"].update(existing.get("entries", {}))
+index["entries"].update(new_entries)
 
-index['entries'].update(new_entries)
-index['gc_roots'] = list(set(index['gc_roots'] + gc_roots))
+index["gc_roots"] = sorted(
+    set(existing.get("gc_roots", [])) | set(new_gc_roots)
+)
 
-if not public_key and existing.get('public_key'):
-    index['public_key'] = existing['public_key']
+with open(os.environ["OUTPUT_FILE"], "w") as f:
+    json.dump(index, f, indent=2, sort_keys=True)
 
-json.dump(index, open('$index_file', 'w'), indent=2, sort_keys=True)
-" "$existing_index" "$new_entries" "$gc_roots" "$public_key" "$NIXCACHE_REPO"
+print(
+    f">>> Cache index rebuilt: {len(index['entries'])} total entries "
+    f"({len(new_entries)} new), {len(index['gc_roots'])} gc roots"
+)
+PYEOF
 
     # Push index as a blob
     local index_digest
@@ -587,9 +566,14 @@ start_self_substituter() {
         return 0
     fi
 
+    # NIXCACHE_UPSTREAM="" — skip proxy's internal upstream fallback. Nix
+    # already queries cache.nixos.org and the flake's other substituters
+    # directly in parallel, so the proxy blocking on an upstream HTTP call
+    # per miss just serializes what Nix would otherwise do concurrently.
     NIXCACHE_REPO="$NIXCACHE_REPO" \
     NIXCACHE_PORT=37515 \
     NIXCACHE_LISTEN=127.0.0.1 \
+    NIXCACHE_UPSTREAM="" \
     GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
         python3 "$proxy_script" &
     SELF_PROXY_PID=$!
@@ -618,11 +602,72 @@ extra-substituters = http://127.0.0.1:37515
 extra-trusted-substituters = http://127.0.0.1:37515
 EOF
         info "Added self-substituter to $nix_conf"
+
+        # Trust our own signing key so Nix will accept signed NARs served
+        # by the proxy. Without this, require-sigs rejects them and we'd
+        # rebuild everything on every run instead of substituting.
+        if [[ -n "${NIXCACHE_SIGNING_KEY_FILE:-}" ]] && [[ -f "$NIXCACHE_SIGNING_KEY_FILE" ]]; then
+            local pub_key
+            pub_key=$(nix key convert-secret-to-public < "$NIXCACHE_SIGNING_KEY_FILE" 2>/dev/null || true)
+            if [[ -n "$pub_key" ]]; then
+                echo "extra-trusted-public-keys = $pub_key" >> "$nix_conf"
+                info "Trusted own public key: $pub_key"
+            fi
+        fi
     else
         info "Self-substituter failed to start, continuing without it"
         kill "$SELF_PROXY_PID" 2>/dev/null || true
         SELF_PROXY_PID=""
     fi
+}
+
+# find_locally_built_paths — enumerate the full closure of the given output
+# paths and return only those with NO signatures. Paths substituted from
+# any cache (external or our own) carry that cache's signature in their
+# narinfo; locally-built paths have no signature. Skip anything already in
+# our GHCR index (uploaded in a previous run). This replaces the old
+# --dry-run narinfo fan-out: it's pure local sqlite state, thousands of
+# times faster, and it's what cachix-action does.
+find_locally_built_paths() {
+    local paths=("$@")
+
+    # Pull our GHCR index so we can skip already-uploaded paths.
+    local own_hashes=""
+    oci_get_token 2>/dev/null || true
+    local existing_manifest
+    existing_manifest=$(oci_get_manifest "cache-index" 2>/dev/null)
+    if [[ -n "$existing_manifest" ]]; then
+        local index_digest
+        index_digest=$(echo "$existing_manifest" | jq -r '.layers[0].digest // empty' 2>/dev/null)
+        if [[ -n "$index_digest" ]]; then
+            own_hashes=$(oci_get_blob "$index_digest" 2>/dev/null | \
+                jq -r '.entries | keys[]' 2>/dev/null || true)
+        fi
+    fi
+    local own_count=0
+    if [[ -n "$own_hashes" ]]; then
+        own_count=$(echo "$own_hashes" | wc -l)
+    fi
+    info "GHCR index contains $own_count previously-cached entries"
+
+    # Walk the closure once. `nix path-info --json --recursive` returns
+    # either a list (newer Nix) or a path-keyed object (older Nix); the
+    # jq normalization handles both.
+    nix path-info --json --recursive "${paths[@]}" 2>/dev/null | \
+        jq -r '
+            (if type == "array" then .
+             else (to_entries | map({path: .key} + .value))
+             end) |
+            .[] | select((.signatures // []) | length == 0) | .path
+        ' | while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            local h
+            h=$(basename "$path" | cut -c1-32)
+            if [[ -n "$own_hashes" ]] && echo "$own_hashes" | grep -qxF "$h"; then
+                continue
+            fi
+            echo "$path"
+        done | sort -u
 }
 
 stop_self_substituter() {
@@ -638,11 +683,12 @@ full_pipeline() {
     info "Starting OCI cache pipeline"
     info "Config: $flake_dir | Image: $NIXCACHE_IMAGE"
 
-    # 0. Start our own cache as a substituter to reuse previous builds
+    # 0. Start our proxy as a substituter. Gives Nix access to paths
+    #    cached from previous runs without rebuilding.
     SELF_PROXY_PID=""
     start_self_substituter
 
-    # 1. Discover outputs
+    # 1. Discover outputs.
     local discovered
     discovered=$(discover_outputs "$flake_dir")
     if [[ -z "$discovered" ]]; then
@@ -655,44 +701,40 @@ full_pipeline() {
     info "Discovered ${#refs_array[@]} output(s) to build"
     printf '    %s\n' "${refs_array[@]}" >&2
 
-    # 2. Determine what would need building vs what's already cached
-    #    Uses --dry-run which respects ALL configured substituters
-    local needs_building
-    needs_building=$(find_paths_to_cache "${refs_array[@]}")
-    local needs_count=0
-    if [[ -n "$needs_building" ]]; then
-        needs_count=$(echo "$needs_building" | wc -l)
-    fi
-    info "Paths needing build (not in any cache): $needs_count"
-
-    # 3. Build all outputs (Nix fetches cached paths from substituters)
+    # 2. Build all outputs. Nix does narinfo resolution and substitution
+    #    inline, interleaved with compilation — no separate dry-run pass.
+    #    --accept-flake-config so the flake's extra-substituters (jovian,
+    #    cachyos via lantian, etc.) are used in parallel with cache.nixos.org.
     local output_paths
     output_paths=$(build_outputs "${refs_array[@]}")
     local paths_array
     mapfile -t paths_array <<< "$output_paths"
-    info "Built ${#paths_array[@]} output path(s)"
+    info "Built ${#paths_array[@]} top-level output(s)"
 
-    # Done with self-substituter
+    # Done with the self-substituter — the rest is local + GHCR uploads.
     stop_self_substituter
 
-    # 4. Determine what to upload: paths that were actually built locally
-    #    (not fetched from any substituter)
-    if [[ -z "$needs_building" ]]; then
-        info "All paths were available from caches — nothing new to upload"
+    # 3. Signature-based filter: upload only paths built locally (no sig).
+    #    Paths with any signature came from some cache already.
+    info "Inspecting closure signatures to find locally-built paths"
+    local upload_list
+    upload_list=$(find_locally_built_paths "${paths_array[@]}")
+    if [[ -z "$upload_list" ]]; then
+        info "Nothing to upload — every path has an external or existing signature"
         write_summary "${#refs_array[@]}" 0 0 "${#paths_array[@]}"
         return 0
     fi
-    local local_array
-    mapfile -t local_array <<< "$needs_building"
-    info "New paths to cache: ${#local_array[@]}"
+    local upload_array
+    mapfile -t upload_array <<< "$upload_list"
+    info "Locally-built paths to upload: ${#upload_array[@]}"
 
-    # 5. Export only the new paths (direct NAR dump)
-    export_paths_directly "${local_array[@]}"
+    # 4. Export NARs (this step also signs them with our key).
+    export_paths_directly "${upload_array[@]}"
 
-    # 6. Upload to GHCR
+    # 5. Upload NARs + index manifest to GHCR.
     upload_to_oci "${paths_array[@]}"
 
-    write_summary "${#refs_array[@]}" "${#local_array[@]}" "${#local_array[@]}" "${#paths_array[@]}"
+    write_summary "${#refs_array[@]}" "${#upload_array[@]}" "${#upload_array[@]}" "${#paths_array[@]}"
     info "Pipeline complete!"
 }
 
