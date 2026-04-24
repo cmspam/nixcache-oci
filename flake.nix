@@ -97,9 +97,14 @@
             NIXCACHE_REPO = cfg.repo;
             NIXCACHE_PORT = toString cfg.port;
             NIXCACHE_LISTEN = cfg.listenAddress;
+            # DynamicUser has no writable $HOME, so the proxy's default
+            # Path.home()/.cache path resolves to /.cache on a read-only
+            # root fs. Every request thread crashes mkdir'ing there. Point
+            # at systemd's CacheDirectory = "nixcache-proxy" instead.
+            NIXCACHE_INDEX_DIR = "/var/cache/nixcache-proxy";
           };
           serviceConfig = {
-            ExecStart = "${self.packages.${pkgs.system}.cache-proxy}/bin/nixcache-proxy";
+            ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.cache-proxy}/bin/nixcache-proxy";
             Restart = "on-failure";
             DynamicUser = true;
             CacheDirectory = "nixcache-proxy";
