@@ -334,7 +334,7 @@ def main():
     print(f"  Upstream: {', '.join(UPSTREAM_CACHES)}", file=sys.stderr)
     print(f"  Index TTL: {INDEX_TTL}s", file=sys.stderr)
 
-    server = http.server.HTTPServer((LISTEN_ADDR, PORT), CacheHandler)
+    server = http.server.ThreadingHTTPServer((LISTEN_ADDR, PORT), CacheHandler)
 
     # Pre-fetch index in background so server starts immediately
     threading.Thread(target=cache_index.get, daemon=True).start()
