@@ -351,8 +351,16 @@ def main():
     threading.Thread(target=cache_index.get, daemon=True).start()
 
     def shutdown(signum, frame):
+        # server.shutdown() blocks until serve_forever() returns. If we call
+        # it from this signal handler — which runs on the same thread as
+        # serve_forever() — we deadlock: serve_forever() can't exit until
+        # the handler returns, the handler can't return until shutdown()
+        # exits. systemd then waits TimeoutStopSec (default 90s) before
+        # SIGKILL. Spin shutdown() off in a separate thread so the handler
+        # returns immediately and serve_forever()'s loop notices the
+        # shutdown flag and exits cleanly within milliseconds.
         print("\nShutting down...", file=sys.stderr)
-        server.shutdown()
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
