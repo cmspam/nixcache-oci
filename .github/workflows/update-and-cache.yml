@@ -17,6 +17,16 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
+        with:
+          flakehub: false
+
+      # Opt-in: Disabled by default. Set the GitHub variable ENABLE_MAGIC_NIX_CACHE to 'true' to enable.
+      - name: Magic Nix Cache
+        if: vars.ENABLE_MAGIC_NIX_CACHE == 'true'
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
 
       - name: Setup signing key
         run: |
