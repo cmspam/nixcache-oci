@@ -252,6 +252,84 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_HEAD(self):
+        path = self.path.rstrip("/")
+        if path == "/nix-cache-info":
+            self._head_bytes(get_nci_response(), "text/x-nix-cache-info")
+        elif path == "/public-key":
+            self._head_public_key()
+        elif path.endswith(".narinfo"):
+            self._head_narinfo(path)
+        elif path.startswith("/nar/"):
+            self._head_nar(path)
+        else:
+            self.send_error(404)
+
+    def _head_bytes(self, data: bytes, content_type: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+
+    def _head_public_key(self):
+        index = cache_index.get()
+        pk = index.get("public_key", "")
+        if pk:
+            data = pk.encode() + b"\n"
+            self._head_bytes(data, "text/plain")
+        else:
+            self.send_error(404, "No public key configured")
+
+    def _head_narinfo(self, path: str):
+        store_hash = path.lstrip("/").removesuffix(".narinfo")
+
+        # Look up in our OCI index — instant, no network
+        entry = cache_index.lookup(store_hash)
+        if entry and "narinfo" in entry:
+            body = entry["narinfo"].encode("utf-8")
+            self._head_bytes(body, "text/x-nix-narinfo")
+            return
+
+        # Fall back to upstream
+        for cache_url in UPSTREAM_CACHES:
+            req = urllib.request.Request(f"{cache_url}/{store_hash}.narinfo", method="HEAD")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/x-nix-narinfo")
+                    self.send_header("Content-Length", resp.headers.get("Content-Length", "0"))
+                    self.end_headers()
+                    return
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                pass
+        self.send_error(404)
+
+    def _head_nar(self, path: str):
+        nar_basename = path.removeprefix("/nar/")
+        ct = "application/x-xz" if nar_basename.endswith(".xz") else "application/x-nix-nar"
+
+        # Try our GHCR cache — check existence
+        nar_digest = cache_index.find_nar_digest(nar_basename)
+        if nar_digest:
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.end_headers()
+            return
+
+        # Fall back to upstream — check existence
+        for cache_url in UPSTREAM_CACHES:
+            req = urllib.request.Request(f"{cache_url}{path}", method="HEAD")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", resp.headers.get("Content-Length", "0"))
+                    self.end_headers()
+                    return
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                pass
+        self.send_error(404)
+
     def _serve_bytes(self, data: bytes, content_type: str):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
